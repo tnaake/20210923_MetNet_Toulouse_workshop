@@ -1,0 +1,314 @@
+---
+title: "MetNet - workshop Toulouse"
+author: "Thomas Naake"
+date: "9/23/2021"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: TRUE
+    theme: united
+    number_sections: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages(library("dplyr"))
+suppressPackageStartupMessages(library("igraph"))
+knitr::opts_knit$set(root.dir = "~/Presentation/20210923_Toulouse/")
+```
+
+# Prepare the environment and load the data
+
+Load, if not done yet, the `dplyr` and `igraph` package first.
+```{r prepare_environment, message=FALSE, warning=FALSE}
+library(MetNet)
+
+## print the version of MetNet
+package.version("MetNet")
+```
+
+data requirements:
+- $m~\times~n$ matrix, where columns denote the different samples $n$ and where
+  $m$ features are present,
+- proper data normalization and transformation,
+- information on m/z values has to be stored in a vector of length 
+  $\vert m \vert$ in the column `"mz"`,
+- optionally, information on retention time in the column `"rt"`.
+
+```{r laod_data}
+peaklist_vals <- openxlsx::read.xlsx(
+    xlsxFile = "20210219_CelegansPathogenMicrobiome_RP_pos_Cluster_char.xlsx",
+    sheet = "Stage 3", startRow = 1, colNames = TRUE, rowNames = TRUE,
+    skipEmptyRows = FALSE, skipEmptyCols = FALSE, na.strings = "")
+
+## remove the superfluous columns in peaklist_vals (only keep samples)
+cols_vals <- which(colnames(peaklist_vals) == "QC_cond_2-A,2_10_29503")
+peaklist_vals <- peaklist_vals[, 1:cols_vals]
+
+## extract meta data and intensities from peaklist_vals
+peaklist_meta <- t(peaklist_vals[1:10, ]) %>% 
+    as.data.frame()
+colnames(peaklist_meta) <- make.names(colnames(peaklist_meta))
+peaklist_vals <- peaklist_vals[11:nrow(peaklist_vals), ] %>% 
+    as.matrix()
+mode(peaklist_vals) <- "numeric"
+
+## add the information on the features (mz, retention time)
+peaklist_feat <- read.table(file = "Experimental_Data.csv", sep = ",", header = TRUE)
+rownames(peaklist_feat) <- peaklist_feat[, "Name"]
+```
+
+## Quality check with MatrixQCvis
+
+```{r matrixqcvis, eval = 1:5, message=FALSE}
+## create SummarizedExperiment object
+library(SummarizedExperiment)
+se <- SummarizedExperiment(assays = peaklist_vals, rowData = peaklist_feat, 
+                     colData = peaklist_meta)
+
+library(MatrixQCvis)
+shinyQC(se)
+```
+
+Do the normalization, batch correction, transformation after removing the blank.
+```{r, message=FALSE}
+se <- se[, !grepl(colnames(se), pattern = "blank")]
+
+## remove low-abundant features from se (remove the features with more than
+## 30 missing values)
+se <- se[!apply(assay(se), 1, function(x) sum(is.na(x))) > 30, ]
+
+## normalization
+peaklist_vals <- assay(se) %>%
+    normalizeAssay(., method = "quantile division", probs = 0.75)
+
+## batch correction
+peaklist_vals_b <- peaklist_vals %>% 
+    imputeAssay(., method = "MinDet") %>%
+    sva::ComBat(., batch = se$Batch)
+peaklist_vals_b[is.na(peaklist_vals)] <- NA
+
+## check the variance homogeneity and perform vsn transformation
+vsn::meanSdPlot(peaklist_vals_b)
+peaklist_vals <- vsn::vsn2(peaklist_vals_b)
+vsn::meanSdPlot(peaklist_vals)
+
+## create a peaklist object that contains information on the mz and rt and 
+## the transformed intensities
+peaklist <- data.frame(mz = rowData(se)[, "mz"], rt = rowData(se)[, "RT"], 
+                  peaklist_vals@hx)
+
+## assign new rownames to peaklist (composed of mz and RT information)
+rn <- paste0("m", round(peaklist[, "mz"], 3), "_", round(peaklist[, "rt"], 2))
+peaklist <- peaklist[!duplicated(rn), ]
+rownames(peaklist) <- rn[!duplicated(rn)]
+
+## remove the columns with the QCs
+peaklist <- peaklist[, !grepl(colnames(peaklist), pattern = "QC_")]
+```
+
+# Structural AdjacencyMatrix object
+
+```{r define_transformations}
+transformations <- rbind(
+    c("Hydroxylation (-H)", "O", 15.9949146221, "-"),
+    c("Malonyl group (-H2O)", "C3H2O3", 86.0003939305, "+"),
+    c("Monosaccharide (-H2O)", "C6H10O5", 162.0528234315, "-"))
+
+## convert to data frame
+transformations <- data.frame(
+    group = transformations[, 1],
+    formula = transformations[, 2],
+    mass = as.numeric(transformations[, 3]),
+    rt = transformations[, 4])
+```
+
+Create the structural adjacency matrix by running the function `structural`.
+```{r create_struct_adj}
+struct_adj <- structural(x = peaklist, transformation = transformations,
+                         ppm = 10)
+```
+
+Print information on the object `struct_adj`.
+```{r struct_adj_information}
+struct_adj
+
+## get information on type, directed, thresholded
+struct_adj@type
+struct_adj@directed
+struct_adj@thresholded
+
+## show the stored adjacency matrices
+assay(struct_adj, "binary")[26:28, 614:616]
+assay(struct_adj, "transformation")[26:28, 614:616]
+assay(struct_adj, "mass_difference")[26:28, 614:616]
+
+## how many edges are there in total
+assay(struct_adj, "binary") %>% 
+    table()
+```
+
+## Refining the structural AdjacencyMatrix object (rtCorrection)
+
+Use the retention time information to remove false positive associations
+by accounting for the polarity change. Use the function `rtCorrection`. The
+slot will change from `FALSE` (`struct_adj`) to `TRUE` (`struct_adj_rt`).
+
+```{r create_struct_adj_rt}
+struct_adj_rt <- rtCorrection(am = struct_adj, x = peaklist, 
+                              transformation = transformations)
+struct_adj
+struct_adj_rt
+
+## how many edges are there in total
+assay(struct_adj_rt, "binary") %>% 
+    table()
+```
+
+Get information which features link to each other
+```{r struct_df}
+## show the information in struct_adj_rt in tabular format
+struct_df <- as.data.frame(struct_adj_rt)
+filter(struct_df, binary == 1) %>% 
+    head()
+```
+
+Mass-difference distribution of the data. The number of determined
+mass differences can be displayed by using the `mz_vis` function 
+```{r mz_summary}
+mz_sum <- mz_summary(struct_adj_rt)
+mz_sum
+
+## visualize the numbers
+mz_vis(mz_sum)
+```
+
+## Creating a directed structural AdjacencyMatrix object 
+
+```{r create_directed}
+## undirected
+struct_adj_undir <- structural(x = peaklist,
+        transformation = transformations, ppm = 10, directed = FALSE) %>%
+    rtCorrection(am = ., x = peaklist, transformation = transformations)
+struct_adj_undir
+
+## directed
+struct_adj_dir <- structural(x = peaklist, 
+        transformation = transformations, ppm = 10, directed = TRUE) %>%
+    rtCorrection(am = ., x = peaklist, transformation = transformations)
+struct_adj_dir
+
+## plot the undirected matrix
+adj <- assay(struct_adj_undir, "binary")
+g_undirected_comp <- graph_from_adjacency_matrix(adjmatrix = adj, 
+        mode = "directed", weighted = NULL) %>%
+    components()
+inds <- g_undirected_comp$membership %in% which(g_undirected_comp$csize > 10)
+
+## create a graph from the cut adjacency matrix and plot the undirected graph
+g_undirected <- graph_from_adjacency_matrix(adj[inds, inds], mode = "directed")
+plot(g_undirected, edge.width = 1, edge.arrow.size = 0.3,
+     vertex.label.cex = 0.4, vertex.size = 0.5, edge.color = "grey")
+
+## plot the directed matrix
+adj <- assay(struct_adj_dir, "binary")
+g_directed_comp <- graph_from_adjacency_matrix(adjmatrix = adj, 
+          mode = "directed", weighted = NULL) %>%
+      components()
+inds <- g_directed_comp$membership %in% which(g_directed_comp$csize > 10)
+
+## create a graph from the cut adjacency matrix and plot the directed graph
+g_directed <- graph_from_adjacency_matrix(adj[inds, inds], mode = "directed")
+plot(g_directed, edge.width = 1, edge.arrow.size = 0.3,
+     vertex.label.cex = 0.4, vertex.size = 0.5, edge.color = "grey")
+```
+
+
+## Visualize the structural AdjacencyMatrix
+
+Use the `igraph` package to calculate a graph from the adjacency matrix. 
+Only show those components with more than 10 members.
+
+```{r vis_struct_adj, eval = FALSE, echo = FALSE}
+adj <- assay(struct_adj_rt, "binary")
+g_comp <-  graph_from_adjacency_matrix(adj, mode = "undirected") %>% 
+    components()
+inds <- g_comp$membership %in% which(g_comp$csize > 10)
+g <- graph_from_adjacency_matrix(adj[inds, inds], mode = "undirected")
+
+## finally plot the graph
+plot(g, edge.width = 1, edge.arrow.size = 0.3, vertex.label = NA, 
+    vertex.size = 0.5, edge.color = "grey")
+```
+
+# Statistical AdjacencyMatrix object
+
+Create the adjacency matrix based on Pearson and Spearman correlation.
+```{r create_stat_adj, warning=FALSE}
+## the function takes as input a numerical matrix with 
+## (transformed) intensities
+stat_adj <- select(peaklist, -c("mz", "rt")) %>% 
+    as.matrix() %>%
+    statistical(., model = c("pearson", "spearman", "pearson_partial", "pearson_semipartial"), p.adjust = "BH")
+
+## print information on stat_adj
+stat_adj
+```
+
+Return the edges with Pearson correlation coefficients $> 0.6$ and 
+Spearman correlation coefficients $> 0.6$ and adjusted p-values $< 0.05$.
+```{r create_stat_adj_thr}
+## define the filter criteria
+args_thr <- list(
+    filter = "abs(pearson_coef) > 0.6 & abs(spearman_coef) > 0.6 & pearson_pvalue < 0.05 & spearman_pvalue < 0.05")
+
+## apply the filter criteria on stat_adj and add an assay containing
+## binary information
+stat_adj_thr <- threshold(am = stat_adj, type = "threshold", 
+                          args = args_thr)
+stat_adj_thr
+
+## show the information in stat_adj_thr in tabular format
+stat_adj_thr_df <- as.data.frame(stat_adj_thr)
+head(stat_adj_thr_df)
+```
+
+# Combine the structural and statistical AdjacencyMatrix object
+
+```{r create_comb_adj}
+comb_adj <- combine(am_structural = struct_adj_rt, 
+                    am_statistical = stat_adj_thr)
+
+## print information on stat_adj
+comb_adj
+
+## show the information in comb_adj in tabular format
+comb_adj_df <- as.data.frame(comb_adj)
+filter(comb_adj_df, combine_binary == 1) %>% 
+    head()
+```
+
+## Visualization
+
+Visualize the final adjacency matrix that combines the information from 
+both structural and statistical information.
+```{r vis_comb_adj}
+adj <- assay(comb_adj, "combine_binary")
+g_comp <- graph_from_adjacency_matrix(adj, mode = "undirected") %>%
+    components()
+inds <- g_comp$membership %in% which(g_comp$csize > 3)
+
+## create a graph from the cut adjacency matrix
+g <- graph_from_adjacency_matrix(adj[inds, inds], mode = "undirected")
+
+## finally plot the graph
+plot(g, edge.width = 1, vertex.label.cex = 0.5, vertex.size = 0.5,
+     edge.color = "grey")
+```
+
+
+```{r save_objects, echo = FALSE, eval = TRUE}
+save(list = ls(), file = "MetNet_workshop_Celegans_objects.RData")
+```
