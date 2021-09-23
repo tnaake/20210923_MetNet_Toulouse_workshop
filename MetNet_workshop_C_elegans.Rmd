@@ -251,7 +251,7 @@ Create the adjacency matrix based on Pearson and Spearman correlation.
 ## (transformed) intensities
 stat_adj <- select(peaklist, -c("mz", "rt")) %>% 
     as.matrix() %>%
-    statistical(., model = c("pearson", "spearman", "pearson_partial", "pearson_semipartial"), p.adjust = "BH")
+    statistical(., model = c("pearson", "spearman"), p.adjust = "BH")
 
 ## print information on stat_adj
 stat_adj
